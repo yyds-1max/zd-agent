@@ -16,7 +16,7 @@
 - `bot/feishu/`：飞书机器人占位目录。
 - `tests/`：单元与集成测试。
 
-## 快速启动（草案）
+## 快速启动
 ```
 python -m venv .venv
 ./.venv/Scripts/Activate.ps1
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 python scripts/demo_cli.py
 ```
 
-## 入库与查询（MVP）
+## 入库与查询
 ```
 # 执行知识入库（读取 data/fixtures 下的 .txt 文档）
 python scripts/ingest_knowledge.py --source-dir data/fixtures
@@ -52,7 +52,7 @@ CLI 输入格式固定为：
 向量索引默认使用 Chroma，落盘目录为 `storage/vector/`。
 Embedding 默认使用 DashScope `text-embedding-v4`，请先配置 `DASHSCOPE_API_KEY`。
 
-## LLM 配置（默认 qwen3-max）
+## LLM 配置
 问答主链路中的意图解析、主答案生成、版本差异总结默认使用 `qwen3-max`。
 
 ```bash
@@ -95,7 +95,7 @@ OPENAI_BASE_URL=
 
 当本地未安装 `langgraph` 时，会自动回退为同逻辑的顺序执行。
 
-## 推荐与推送接口（MVP）
+## 推荐与推送接口
 - `POST /recommendation`：基于用户画像 + 最近查询/点击行为 + 文档新鲜度返回结构化推荐。
 - `POST /recommendation/push/trigger`：手动触发推荐推送并落推送日志（`recommendation_push_logs`）。
 
