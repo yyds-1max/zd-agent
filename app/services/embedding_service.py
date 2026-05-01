@@ -1,40 +1,74 @@
-import os
+from __future__ import annotations
 
-from app.core.config import settings
+from abc import ABC, abstractmethod
+from typing import Any
 
-try:
-    from langchain_community.embeddings import DashScopeEmbeddings
-except ImportError:  # pragma: no cover - 依赖未安装时的兜底
-    DashScopeEmbeddings = None  # type: ignore[assignment]
+import requests
 
 
-class EmbeddingService:
-    def __init__(self) -> None:
-        self.model = settings.embedding_model
-        self._client = None
+class EmbeddingService(ABC):
+    @abstractmethod
+    def is_available(self) -> bool: ...
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        client = self._get_client()
-        return client.embed_documents(texts)
+    @abstractmethod
+    def embed_texts(self, texts: list[str]) -> list[list[float]]: ...
 
     def embed_query(self, text: str) -> list[float]:
-        client = self._get_client()
-        return client.embed_query(text)
+        return self.embed_texts([text])[0]
 
-    def _get_client(self):
-        if self._client is not None:
-            return self._client
-        self._client = self._build_client()
-        return self._client
 
-    def _build_client(self):
-        if DashScopeEmbeddings is None:
-            raise RuntimeError("未安装 LangChain DashScope 依赖，请执行 `pip install -r requirements.txt`。")
+class DashScopeEmbeddingService(EmbeddingService):
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str,
+        model: str,
+        dimensions: int,
+        batch_size: int = 10,
+        timeout_seconds: int = 30,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.dimensions = dimensions
+        self.batch_size = batch_size
+        self.timeout_seconds = timeout_seconds
 
-        api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("未检测到 DashScope API Key，请设置 `DASHSCOPE_API_KEY` 环境变量。")
+    def is_available(self) -> bool:
+        return bool(self.api_key)
 
-        return DashScopeEmbeddings(model=self.model, dashscope_api_key=api_key)
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not self.api_key:
+            raise RuntimeError("DASHSCOPE_API_KEY is required for remote embeddings.")
+        if not texts:
+            return []
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            chunk = texts[start : start + self.batch_size]
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "input": chunk,
+                "encoding_format": "float",
+                "dimensions": self.dimensions,
+            }
+            response = requests.post(
+                f"{self.base_url}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self.timeout_seconds,
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = response.text.strip()
+                raise requests.HTTPError(
+                    f"{exc}. Response body: {detail}",
+                    response=response,
+                ) from exc
+            data = response.json().get("data", [])
+            ordered = sorted(data, key=lambda item: item["index"])
+            embeddings.extend(item["embedding"] for item in ordered)
+        return embeddings

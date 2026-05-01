@@ -1,442 +1,442 @@
-import os
-import re
+from __future__ import annotations
 
-from app.core.config import settings
-from app.schemas.citation import Citation
+import json
 
-try:
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - 依赖缺失时走规则兜底
-    OpenAI = None  # type: ignore[assignment]
+from app.schemas.answer_strategy import AnswerStrategyResult
+from app.schemas.intent import IntentResult
+from app.schemas.knowledge import Citation, KnowledgeChunk, KnowledgeDocument, RetrievedChunk
+from app.schemas.llm import AgentAnswerLLMOutput
+from app.schemas.query import QueryResponse
+from app.schemas.user import UserProfile
+from app.schemas.version import VersionCheckResult, VersionDiffResult
+from app.services.main_agent_prompt import evidence_answer_block
+from app.services.qwen_llm_service import QwenStructuredLLMService
+from app.services.version_service import VersionService
 
 
 class AnswerService:
-    POLICY_KEYWORDS = (
-        "制度",
-        "规范",
-        "规则",
-        "报销",
-        "审批",
-        "流程",
-        "标准",
-        "适用范围",
-        "生效",
-        "合规",
-    )
-
-    def __init__(self, enable_llm_generation: bool | None = None) -> None:
-        if enable_llm_generation is None:
-            self._enable_llm_generation = settings.enable_llm_answer_generation
-        else:
-            self._enable_llm_generation = enable_llm_generation
-        self._model_name = settings.answer_model.strip() or settings.chat_model.strip() or "qwen3-max"
-        self._client = None
+    def __init__(
+        self,
+        version_service: VersionService,
+        llm_service: QwenStructuredLLMService | None = None,
+    ):
+        self.version_service = version_service
+        self.llm_service = llm_service
 
     def compose(
         self,
         question: str,
-        citations: list[Citation],
-        intent_type: str | None = None,
-        version_hint: str | None = None,
-    ) -> str:
-        if not citations:
-            return self._build_empty_answer(question)
-
-        llm_answer = self._compose_with_llm(question, citations, intent_type, version_hint)
-        if llm_answer:
-            return self._append_version_notice(llm_answer, version_hint)
-
-        version_focus = self._build_version_focus(question, citations)
-        top = (
-            version_focus.get("latest_item")  # type: ignore[assignment]
-            if version_focus and version_focus.get("latest_item") is not None
-            else citations[0]
-        )
-        summary = self._build_summary(question, top, version_focus=version_focus)
-        version = self._build_version(top, version_focus=version_focus)
-        effective_time = self._build_effective_time(top, version_focus=version_focus)
-        scope = self._build_scope(top)
-        sources = self._build_sources(citations)
-        version_extra = self._build_version_extra_blocks(version_focus)
-
-        if self._is_policy_question(question, citations, intent_type):
-            answer = (
-                "【制度类答复】\n"
-                "本回答按企业制度模板生成，优先使用当前用户可见的制度依据。\n\n"
-                f"【答案摘要】\n{summary}\n\n"
-                f"【制度口径】\n"
-                f"1. 请按引用中的当前制度版本执行。\n"
-                f"2. 如业务场景有例外，需按制度要求补充审批。\n\n"
-                f"【引用来源】\n{sources}\n\n"
-                f"【版本】\n{version}\n\n"
-                f"【生效时间】\n{effective_time}\n\n"
-                f"【适用范围】\n{scope}"
+        profile: UserProfile,
+        intent: IntentResult,
+        retrieved_chunks: list[RetrievedChunk],
+        version_checks: list[VersionCheckResult],
+        version_diffs: list[VersionDiffResult],
+        answer_strategy: AnswerStrategyResult,
+        tool_trace: list[str],
+    ) -> QueryResponse:
+        if not retrieved_chunks:
+            return QueryResponse(
+                question=question,
+                answer="我没有在你当前权限范围内找到可直接回答这个问题的知识片段。",
+                user_profile=profile,
+                intent=intent,
+                citations=[],
+                version_checks=[],
+                version_diffs=[],
+                answer_strategy=answer_strategy,
+                version_notice=None,
+                notes=["已执行权限过滤，但没有命中可访问 chunk。"],
+                tool_trace=tool_trace,
             )
-            if version_extra:
-                answer = f"{answer}\n\n{version_extra}"
-            return self._append_version_notice(answer, version_hint)
 
-        answer = (
-            f"【答案摘要】\n{summary}\n\n"
-            f"【引用来源】\n{sources}\n\n"
-            f"【版本】\n{version}\n\n"
-            f"【生效时间】\n{effective_time}\n\n"
-            f"【适用范围】\n{scope}"
+        strategy_chunks = self._select_strategy_chunks(
+            retrieved_chunks=retrieved_chunks,
+            answer_strategy=answer_strategy,
         )
-        if version_extra:
-            answer = f"{answer}\n\n{version_extra}"
-        return self._append_version_notice(answer, version_hint)
+        lead_chunk = self._select_lead_chunk(strategy_chunks)
+        lead_document = self.version_service.document_for_chunk(lead_chunk)
+        key_points = self._extract_key_points(
+            question=question,
+            intent=intent,
+            retrieved_chunks=strategy_chunks,
+            answer_strategy=answer_strategy,
+            version_diffs=version_diffs,
+        )
+        version_notice = self._build_version_notice(lead_document, version_checks, answer_strategy)
+        citations = self._build_citations(strategy_chunks)
+
+        answer_text, llm_used = self._compose_answer_text(
+            question=question,
+            profile=profile,
+            intent=intent,
+            lead_chunk=lead_chunk,
+            lead_document=lead_document,
+            key_points=key_points,
+            version_notice=version_notice,
+            citations=citations,
+            version_diffs=version_diffs,
+            answer_strategy=answer_strategy,
+        )
+
+        notes = ["已先做权限过滤，再做 chunk 级混合检索和版本校验。"]
+        final_tool_trace = list(tool_trace)
+        if version_notice:
+            notes.append("已按回答策略补充版本提醒。")
+        if version_diffs:
+            notes.append("已完成新旧版本 chunk 差异分析。")
+        notes.append(f"回答策略：{answer_strategy.mode}")
+        if llm_used:
+            final_tool_trace.append("主Agent：已使用 qwen3-max 基于 chunk 检索证据生成最终回答。")
+        else:
+            final_tool_trace.append("主Agent：当前使用规则模板生成最终回答。")
+
+        return QueryResponse(
+            question=question,
+            answer=answer_text,
+            user_profile=profile,
+            intent=intent,
+            citations=citations,
+            version_checks=version_checks,
+            version_diffs=version_diffs,
+            answer_strategy=answer_strategy,
+            version_notice=version_notice,
+            notes=notes,
+            tool_trace=final_tool_trace,
+        )
+
+    def _compose_answer_text(
+        self,
+        *,
+        question: str,
+        profile: UserProfile,
+        intent: IntentResult,
+        lead_chunk: KnowledgeChunk,
+        lead_document: KnowledgeDocument,
+        key_points: list[str],
+        version_notice: str | None,
+        citations: list[Citation],
+        version_diffs: list[VersionDiffResult],
+        answer_strategy: AnswerStrategyResult,
+    ) -> tuple[str, bool]:
+        if self.llm_service is not None and self.llm_service.is_available():
+            try:
+                output = self._compose_with_llm(
+                    question=question,
+                    profile=profile,
+                    intent=intent,
+                    lead_chunk=lead_chunk,
+                    lead_document=lead_document,
+                    key_points=key_points,
+                    version_notice=version_notice,
+                    citations=citations,
+                    version_diffs=version_diffs,
+                    answer_strategy=answer_strategy,
+                )
+                return output.answer_markdown.strip(), True
+            except Exception:
+                pass
+        return self._compose_with_template(
+            lead_document=lead_document,
+            key_points=key_points,
+            version_notice=version_notice,
+            version_diffs=version_diffs,
+            answer_strategy=answer_strategy,
+        ), False
 
     def _compose_with_llm(
         self,
+        *,
         question: str,
+        profile: UserProfile,
+        intent: IntentResult,
+        lead_chunk: KnowledgeChunk,
+        lead_document: KnowledgeDocument,
+        key_points: list[str],
+        version_notice: str | None,
         citations: list[Citation],
-        intent_type: str | None,
-        version_hint: str | None,
-    ) -> str | None:
-        if not self._enable_llm_generation:
-            return None
-        client = self._get_client()
-        if client is None:
-            return None
-
-        version_focus = self._build_version_focus(question, citations)
-        refs = self._build_reference_context(citations)
-        required_sections = ["【答案摘要】", "【引用来源】", "【版本】", "【生效时间】", "【适用范围】"]
-        extra_policy_instruction = ""
-        if self._is_policy_question(question, citations, intent_type):
-            extra_policy_instruction = "如果是制度类问题，必须额外输出【制度口径】小节（两条以内）。"
-        extra_version_instruction = ""
-        version_focus_context = "无"
-        if version_focus and version_focus.get("latest_item") is not None:
-            extra_version_instruction = (
-                "若用户明确提问的是指定旧版本（例如 V1.0），你必须先回答该指定版本口径，"
-                "再说明当前有更新版本，并输出【新旧差异】小节（1-3条）。"
-                "此场景下，请额外输出【版本更新提醒】与【新旧差异】两个小节。"
-            )
-            version_focus_context = self._format_version_focus_context(version_focus)
-
-        prompt = (
-            "你是企业知识助手。你只能依据提供的引用片段回答，不能补充未给出的事实。"
-            "输出必须是中文，并严格包含这些小节标题："
-            + "、".join(required_sections)
-            + "。"
-            "在【引用来源】中必须逐条写出 doc_id、标题、版本、更新时间。"
-            "在【版本】中明确当前使用的版本信息。"
-            + extra_policy_instruction
-            + extra_version_instruction
+        version_diffs: list[VersionDiffResult],
+        answer_strategy: AnswerStrategyResult,
+    ) -> AgentAnswerLLMOutput:
+        system_prompt = (
+            f"{evidence_answer_block()}"
+            "输出必须是严格 JSON。"
+            "不要在 answer_markdown 中输出参考文档列表，引用来源由系统另行追加。"
+            "只有回答策略要求 include_version_notice 时，才简短说明版本变化。"
         )
-        user_content = (
-            f"用户问题：{question}\n"
-            f"意图类型：{intent_type or 'unknown'}\n"
-            f"版本提示：{version_hint or '无'}\n"
-            f"版本专项上下文：{version_focus_context}\n"
-            f"可用引用片段（rerank结果，共{len(citations)}条）：\n{refs}\n"
-            "请基于以上引用生成最终答案。"
+        strategy_instruction = self._strategy_instruction(answer_strategy)
+        citation_payload = [
+            {
+                "chunk_id": item.chunk_id,
+                "doc_id": item.doc_id,
+                "title": item.title,
+                "doc_type": item.doc_type,
+                "version": item.version,
+                "is_latest": item.is_latest,
+                "section_title": item.section_title,
+                "subsection_title": item.subsection_title,
+                "snippet": item.snippet,
+                "chunk_text": item.chunk_text,
+            }
+            for item in citations[:4]
+        ]
+        diff_payload = [
+            {
+                "source_chunk_id": item.source_chunk_id,
+                "source_doc_id": item.source_doc_id,
+                "source_version": item.source_version,
+                "latest_chunk_id": item.latest_chunk_id,
+                "latest_doc_id": item.latest_doc_id,
+                "latest_version": item.latest_version,
+                "change_type": item.change_type,
+                "summary": item.summary,
+                "confidence": item.confidence,
+                "key_changes": item.key_changes,
+            }
+            for item in version_diffs[:4]
+        ]
+        user_prompt = (
+            f"用户问题:\n{question}\n\n"
+            f"回答策略:\n{json.dumps(answer_strategy.model_dump(), ensure_ascii=False, indent=2)}\n\n"
+            f"模式说明:\n{strategy_instruction}\n\n"
+            f"用户画像:\n{json.dumps(profile.model_dump(), ensure_ascii=False, indent=2)}\n\n"
+            f"意图识别结果:\n{json.dumps(intent.model_dump(), ensure_ascii=False, indent=2)}\n\n"
+            f"主参考文档:\n{json.dumps({'title': lead_document.title, 'doc_type': lead_document.doc_type, 'version': lead_document.version}, ensure_ascii=False, indent=2)}\n\n"
+            f"主参考 chunk:\n{json.dumps({'chunk_id': lead_chunk.chunk_id, 'section_title': lead_chunk.section_title, 'subsection_title': lead_chunk.subsection_title, 'text': lead_chunk.text}, ensure_ascii=False, indent=2)}\n\n"
+            f"规则整理出的关键点:\n{json.dumps(key_points, ensure_ascii=False, indent=2)}\n\n"
+            f"版本提醒:\n{version_notice or '无'}\n\n"
+            f"版本差异分析:\n{json.dumps(diff_payload, ensure_ascii=False, indent=2)}\n\n"
+            f"可引用证据 chunks:\n{json.dumps(citation_payload, ensure_ascii=False, indent=2)}\n\n"
+            "请输出 JSON，字段要求：\n"
+            "- answer_markdown: 最终回答，中文，2-6 句，可包含短列表，必须只基于给定证据\n"
+            "- cited_doc_ids: 实际参考到的 doc_id 列表\n"
+            "- notes: 补充说明列表，若无可为空\n"
+        )
+        return self.llm_service.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_model=AgentAnswerLLMOutput,
         )
 
-        try:
-            response = client.chat.completions.create(
-                model=self._model_name,
-                temperature=0.2,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            content = (response.choices[0].message.content or "").strip()
-        except Exception:
-            return None
+    def _compose_with_template(
+        self,
+        *,
+        lead_document: KnowledgeDocument,
+        key_points: list[str],
+        version_notice: str | None,
+        version_diffs: list[VersionDiffResult],
+        answer_strategy: AnswerStrategyResult,
+    ) -> str:
+        if answer_strategy.mode == "change_summary_mode":
+            answer_lines = ["以下基于当前命中的新旧版本证据，直接总结关键变化："]
+            for item in version_diffs[:3]:
+                answer_lines.append(f"- {item.summary}")
+            return "\n".join(answer_lines)
 
-        if not self._is_valid_llm_answer(content, citations):
-            return None
-        return content
-
-    def _get_client(self):
-        if OpenAI is None:
-            return None
-        if self._client is not None:
-            return self._client
-
-        base_url = os.getenv("OPENAI_BASE_URL")
-        api_key: str | None = None
-        if base_url:
-            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
-        elif os.getenv("DASHSCOPE_API_KEY"):
-            api_key = os.getenv("DASHSCOPE_API_KEY")
-            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        if answer_strategy.mode == "historical_lookup_mode":
+            answer_lines = [
+                f"以下先按你询问的历史版本《{lead_document.title}》相关内容回答。",
+            ]
         else:
-            api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
+            answer_lines = [
+                f"按当前生效的《{lead_document.title}》：",
+            ]
 
-        if base_url:
-            self._client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=20.0)
-        else:
-            self._client = OpenAI(api_key=api_key, max_retries=0, timeout=20.0)
-        return self._client
+        if version_notice and answer_strategy.include_version_notice:
+            answer_lines.append(version_notice)
+        if version_diffs and answer_strategy.include_diff_summary:
+            answer_lines.append("版本差异摘要：")
+            for item in version_diffs[:2]:
+                answer_lines.append(f"- {item.summary}")
+        answer_lines.append("核心信息：")
+        for point in key_points:
+            answer_lines.append(f"- {point}")
+        return "\n".join(answer_lines)
 
-    def _build_reference_context(self, citations: list[Citation]) -> str:
-        lines: list[str] = []
-        for idx, item in enumerate(citations, start=1):
-            updated = item.updated_at.isoformat() if item.updated_at else "未知"
-            effective = item.effective_date.isoformat() if item.effective_date else "未知"
-            text = re.sub(r"\s+", " ", item.content_chunk).strip()
-            if len(text) > 360:
-                text = f"{text[:360]}..."
-            lines.append(
-                f"[{idx}] doc_id={item.doc_id} | title={item.title} | source={item.source_type} | "
-                f"version={item.version} | effective_date={effective} | updated_at={updated}\n"
-                f"片段：{text}"
-            )
-        return "\n\n".join(lines)
+    def _select_lead_chunk(self, retrieved_chunks: list[RetrievedChunk]) -> KnowledgeChunk:
+        return retrieved_chunks[0].chunk
 
-    @staticmethod
-    def _is_valid_llm_answer(answer: str, citations: list[Citation]) -> bool:
-        required_headers = ("【答案摘要】", "【引用来源】", "【版本】", "【生效时间】", "【适用范围】")
-        if not answer:
-            return False
-        if not all(header in answer for header in required_headers):
-            return False
-        if not citations:
-            return True
-        # 至少命中一个引用 doc_id，避免“有引用标题但无溯源”。
-        return any(item.doc_id and item.doc_id in answer for item in citations)
-
-    def _build_summary(
+    def _extract_key_points(
         self,
         question: str,
-        top: Citation,
-        version_focus: dict[str, Citation | str] | None = None,
-    ) -> str:
-        if version_focus and version_focus.get("latest_item") is not None:
-            requested_item = version_focus["requested_item"]
-            latest_item = version_focus["latest_item"]
-            requested_fact = self._extract_key_fact(str(requested_item.content_chunk))
-            latest_fact = self._extract_key_fact(str(latest_item.content_chunk))
-            return (
-                f"针对“{question}”，你提到的 {requested_item.version} 口径为：{requested_fact}；"
-                f"当前最新版本 {latest_item.version} 口径为：{latest_fact}。"
-            )
-        snippet = top.content_chunk.strip().replace("\n", " ")
-        if len(snippet) > 220:
-            snippet = f"{snippet[:220]}..."
-        return f"针对“{question}”，当前可用知识摘要如下：{snippet}"
+        intent: IntentResult,
+        retrieved_chunks: list[RetrievedChunk],
+        answer_strategy: AnswerStrategyResult,
+        version_diffs: list[VersionDiffResult],
+    ) -> list[str]:
+        if answer_strategy.mode == "change_summary_mode" and version_diffs:
+            key_points = []
+            for item in version_diffs[:3]:
+                key_points.append(item.summary)
+                key_points.extend(item.key_changes[:2])
+            return key_points[:6]
 
-    @staticmethod
-    def _build_sources(citations: list[Citation]) -> str:
-        lines: list[str] = []
-        for idx, item in enumerate(citations[:3], start=1):
-            updated_at = item.updated_at.isoformat() if item.updated_at else "未知"
-            lines.append(f"{idx}. {item.title}（doc_id={item.doc_id}，更新时间={updated_at}）")
-        return "\n".join(lines)
+        candidate_lines: list[tuple[int, str]] = []
+        for index, item in enumerate(retrieved_chunks[:4]):
+            lines = [line.strip() for line in item.chunk.text.splitlines() if line.strip()]
+            for line in lines:
+                if self._looks_like_heading(line):
+                    continue
+                score = max(0, 8 - index)
+                score += self._score_line(question, intent, line, item.chunk)
+                if score > 0:
+                    candidate_lines.append((score, line))
 
-    @staticmethod
-    def _build_version(
-        top: Citation,
-        version_focus: dict[str, Citation | str] | None = None,
-    ) -> str:
-        if version_focus and version_focus.get("latest_item") is not None:
-            requested_item = version_focus["requested_item"]
-            latest_item = version_focus["latest_item"]
-            return f"指定查询版本：{requested_item.version}；当前生效版本：{latest_item.version}"
-        latest_text = "当前生效版本" if top.is_latest else "非最新版本（请留意版本更新）"
-        return f"{top.version}，{latest_text}"
+        if not candidate_lines:
+            return [retrieved_chunks[0].chunk.text[:200]]
 
-    @staticmethod
-    def _build_scope(top: Citation) -> str:
-        role = "、".join(top.role_scope) if top.role_scope else "未标注"
-        dept = "、".join(top.department_scope) if top.department_scope else "未标注"
-        project = "、".join(top.project_scope) if top.project_scope else "未标注"
-        return f"角色：{role}；部门：{dept}；项目：{project}"
+        candidate_lines.sort(key=lambda item: item[0], reverse=True)
+        deduped: list[str] = []
+        for _, line in candidate_lines:
+            if line not in deduped:
+                deduped.append(line)
+        return deduped[:6]
 
-    def _is_policy_question(
-        self, question: str, citations: list[Citation], intent_type: str | None = None
-    ) -> bool:
-        if intent_type == "policy":
+    def _looks_like_heading(self, line: str) -> bool:
+        text = line.strip()
+        if not text:
             return True
-        if intent_type in {"faq", "project", "chat_summary", "recommendation"}:
-            return False
-        if citations and citations[0].source_type == "policy":
+        if len(text) <= 4 and not any(char.isdigit() for char in text):
             return True
-        normalized = question.strip().lower()
-        return any(keyword in normalized for keyword in self.POLICY_KEYWORDS)
+        heading_prefixes = ("一、", "二、", "三、", "四、", "五、", "六、", "七、", "八、", "九、", "十、")
+        if text.startswith(heading_prefixes) and len(text) <= 14:
+            return True
+        return False
 
-    def _build_empty_answer(self, question: str) -> str:
-        return (
-            f"【答案摘要】\n未找到与“{question}”相关且当前用户可访问的知识。\n\n"
-            f"【引用来源】\n无\n\n"
-            f"【版本】\n无可用版本\n\n"
-            f"【生效时间】\n未知\n\n"
-            f"【适用范围】\n当前问题未命中可用知识"
-        )
-
-    @staticmethod
-    def _append_version_notice(answer: str, version_hint: str | None) -> str:
-        if "【版本更新提醒】" in answer:
-            return answer
-        if not version_hint or "当前有更新版本" not in version_hint:
-            return answer
-        return f"{answer}\n\n【版本更新提醒】\n{version_hint}"
-
-    def _build_effective_time(
+    def _score_line(
         self,
-        top: Citation,
-        version_focus: dict[str, Citation | str] | None = None,
-    ) -> str:
-        if version_focus and version_focus.get("latest_item") is not None:
-            requested_item = version_focus["requested_item"]
-            latest_item = version_focus["latest_item"]
-            requested_effective = (
-                requested_item.effective_date.isoformat() if requested_item.effective_date else "未知"
+        question: str,
+        intent: IntentResult,
+        line: str,
+        chunk: KnowledgeChunk,
+    ) -> int:
+        score = 0
+        section_text = " ".join(
+            part for part in [chunk.section_title, chunk.subsection_title] if part
+        )
+        if intent.name == "policy_lookup":
+            if "标准" in question and any(keyword in line for keyword in ["元", "标准", "费用", "住宿", "餐补", "高铁", "飞机"]):
+                score += 5
+            if any(word in question for word in ["报销", "流程"]) and "报销" in line:
+                score += 3
+            if any(word in question for word in ["最新", "版本"]) and any(marker in line for marker in ["生效", "废止", "版本"]):
+                score += 2
+            if "标准" in question and any(keyword in section_text for keyword in ["费用标准", "住宿费", "餐补", "交通费"]):
+                score += 3
+        elif intent.name == "project_lookup":
+            if any(keyword in line for keyword in ["交付", "节点", "里程碑", "完成"]):
+                score += 4
+            if "2026-" in line:
+                score += 2
+        elif intent.name == "onboarding_lookup":
+            if any(keyword in line for keyword in ["入职", "第一周", "订阅", "入口"]):
+                score += 3
+
+        score += sum(1 for keyword in intent.keywords if keyword and keyword in line.lower())
+        return score
+
+    def _build_version_notice(
+        self,
+        lead_document: KnowledgeDocument,
+        version_checks: list[VersionCheckResult],
+        answer_strategy: AnswerStrategyResult,
+    ) -> str | None:
+        if not answer_strategy.include_version_notice:
+            return None
+        for item in version_checks:
+            if item.has_newer_version and item.source_doc_id == lead_document.doc_id:
+                latest_hint = self._format_chunk_hint(
+                    item.latest_section_title,
+                    item.latest_subsection_title,
+                )
+                return (
+                    f"版本提醒：当前命中的内容来自旧版文档，"
+                    f"最新版为 {item.latest_version or '最新版'}（{item.latest_title}）"
+                    f"{f'，对应内容位于 {latest_hint}' if latest_hint else ''}。"
+                )
+            if item.has_newer_version and item.latest_doc_id == lead_document.doc_id:
+                latest_hint = self._format_chunk_hint(
+                    item.latest_section_title,
+                    item.latest_subsection_title,
+                )
+                return (
+                    f"版本提醒：系统检测到命中的旧版内容，已优先定位到 "
+                    f"{item.latest_version or '最新版'}（{item.latest_title}）"
+                    f"{f' 的对应片段 {latest_hint}' if latest_hint else ''}。"
+                )
+        return None
+
+    def _select_strategy_chunks(
+        self,
+        *,
+        retrieved_chunks: list[RetrievedChunk],
+        answer_strategy: AnswerStrategyResult,
+    ) -> list[RetrievedChunk]:
+        preferred_doc_id = answer_strategy.preferred_doc_id
+        if answer_strategy.mode in {"current_policy_mode", "historical_lookup_mode"} and preferred_doc_id:
+            filtered = [
+                item
+                for item in retrieved_chunks
+                if item.chunk.doc_id == preferred_doc_id
+            ]
+            if filtered:
+                return filtered
+        if answer_strategy.mode == "current_policy_mode":
+            latest_only = [item for item in retrieved_chunks if item.chunk.is_latest]
+            if latest_only:
+                return latest_only
+        return retrieved_chunks
+
+    def _strategy_instruction(self, answer_strategy: AnswerStrategyResult) -> str:
+        if answer_strategy.mode == "current_policy_mode":
+            return (
+                "以当前生效版本为准回答，优先回答用户真正关注的现行规则。"
+                "如果存在旧版命中，只做简明版本提醒，并在必要时补一句关键变化。"
             )
-            latest_effective = latest_item.effective_date.isoformat() if latest_item.effective_date else "未知"
-            return f"指定版本生效时间：{requested_effective}；当前生效版本时间：{latest_effective}"
-        return top.effective_date.isoformat() if top.effective_date else "未知"
+        if answer_strategy.mode == "historical_lookup_mode":
+            return (
+                "先回答旧版内容，再明确告诉用户现行版本及关键变化。"
+                "必须清楚区分旧版内容和新版内容，不能混写。"
+            )
+        if answer_strategy.mode == "change_summary_mode":
+            return (
+                "不要展开普通问答，直接围绕新旧版本差异作答。"
+                "优先使用 diff 结果中的 change_type、summary 和 key_changes。"
+            )
+        return "按常规问答方式回答，优先使用最高相关的检索证据。"
 
-    def _build_version_extra_blocks(self, version_focus: dict[str, Citation | str] | None) -> str:
-        if not version_focus or version_focus.get("latest_item") is None:
-            return ""
-        requested_item = version_focus["requested_item"]
-        latest_item = version_focus["latest_item"]
-        latest_updated = latest_item.updated_at.isoformat() if latest_item.updated_at else "未知"
-        diff = str(version_focus.get("diff") or "").strip()
-        reminder = (
-            f"你询问的是旧版本 {requested_item.version}。当前有更新版本："
-            f"{latest_item.title}（{latest_item.version}，更新时间={latest_updated}）。"
-        )
-        if not diff:
-            return f"【版本更新提醒】\n{reminder}"
-        return f"【版本更新提醒】\n{reminder}\n\n【新旧差异】\n{diff}"
-
-    def _build_version_focus(
-        self, question: str, citations: list[Citation]
-    ) -> dict[str, Citation | str] | None:
-        requested_version = self._extract_requested_version(question)
-        if not requested_version:
-            return None
-        normalized = self._normalize_version_token(requested_version)
-        if not normalized:
-            return None
-
-        matched = [
-            item
-            for item in citations
-            if self._normalize_version_token(item.version) == normalized
-        ]
-        if not matched:
-            return None
-        requested_item = matched[0]
-        latest_item = self._find_latest_related_item(requested_item, citations)
-        if latest_item is None:
-            return None
-        if self._normalize_version_token(latest_item.version) == self._normalize_version_token(requested_item.version):
-            return None
-
-        diff = self._build_diff_with_rules(requested_item.content_chunk, latest_item.content_chunk)
-        return {
-            "requested_version": requested_version,
-            "requested_item": requested_item,
-            "latest_item": latest_item,
-            "diff": diff,
-        }
-
-    @staticmethod
-    def _extract_requested_version(question: str) -> str | None:
-        match = re.search(r"\bV?\d+(?:\.\d+)?\b", question, flags=re.IGNORECASE)
-        if not match:
-            return None
-        return match.group(0)
-
-    @staticmethod
-    def _normalize_version_token(version: object) -> str:
-        text = str(version or "").strip().lower()
-        match = re.search(r"v?(\d+(?:\.\d+)?)", text)
-        if not match:
-            return ""
-        return f"v{match.group(1)}"
-
-    @staticmethod
-    def _normalize_title(title: str) -> str:
-        text = title.strip().lower()
-        text = re.sub(r"[（(]\s*v?\d+(?:\.\d+)?\s*[）)]", "", text)
-        text = re.sub(r"\bv?\d+(?:\.\d+)?\b", "", text)
-        return re.sub(r"\s+", "", text)
-
-    def _find_latest_related_item(self, requested_item: Citation, citations: list[Citation]) -> Citation | None:
-        topic_key = self._normalize_title(requested_item.title)
-        candidates = [
-            item
-            for item in citations
-            if self._normalize_title(item.title) == topic_key
-        ]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda item: (
-                int(bool(item.is_latest)),
-                item.effective_date.isoformat() if item.effective_date else "",
-                item.updated_at.isoformat() if item.updated_at else "",
-                self._version_sort_value(item.version),
-            ),
-            reverse=True,
-        )
-        return candidates[0]
-
-    @staticmethod
-    def _version_sort_value(version: object) -> float:
-        text = str(version or "").lower()
-        match = re.search(r"v?(\d+(?:\.\d+)?)", text)
-        if not match:
-            return 0.0
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return 0.0
-
-    @staticmethod
-    def _build_diff_with_rules(old_text: str, new_text: str) -> str:
-        old_segments = AnswerService._segments(old_text)
-        new_segments = AnswerService._segments(new_text)
-        added = [s for s in new_segments if s not in old_segments][:2]
-        removed = [s for s in old_segments if s not in new_segments][:2]
-        parts: list[str] = []
-        if added:
-            parts.append(f"新版新增/强调：{'；'.join(added)}")
-        if removed:
-            parts.append(f"旧版提及但新版未出现：{'；'.join(removed)}")
+    def _format_chunk_hint(
+        self,
+        section_title: str | None,
+        subsection_title: str | None,
+    ) -> str | None:
+        parts = [part for part in [section_title, subsection_title] if part]
         if not parts:
-            return "核心规则整体一致，建议按最新版本执行。"
-        return "；".join(parts)
+            return None
+        return " / ".join(parts)
 
-    @staticmethod
-    def _segments(text: str) -> list[str]:
-        compact = re.sub(r"\s+", " ", text).strip()
-        if not compact:
-            return []
-        parts = [p.strip() for p in re.split(r"[。；;!！?？\n]", compact) if p.strip()]
-        return [p[:36] for p in parts]
-
-    @staticmethod
-    def _extract_key_fact(text: str) -> str:
-        compact = re.sub(r"\s+", " ", text).strip()
-        if not compact:
-            return "未提取到明确口径。"
-        sentences = [s.strip() for s in re.split(r"[。；;!！?？\n]", compact) if s.strip()]
-        for sentence in sentences:
-            if any(token in sentence for token in ("报销", "时限", "天", "日", "标准", "提交")):
-                return sentence[:80]
-        return sentences[0][:80]
-
-    @staticmethod
-    def _format_version_focus_context(version_focus: dict[str, Citation | str]) -> str:
-        requested_item = version_focus["requested_item"]
-        latest_item = version_focus["latest_item"]
-        diff = str(version_focus.get("diff") or "").strip() or "无"
-        return (
-            f"用户指定版本：{requested_item.version}；"
-            f"指定版本标题：{requested_item.title}；"
-            f"当前最新版本：{latest_item.version}；"
-            f"最新版本标题：{latest_item.title}；"
-            f"差异线索：{diff}"
-        )
+    def _build_citations(
+        self, retrieved_chunks: list[RetrievedChunk]
+    ) -> list[Citation]:
+        citations: list[Citation] = []
+        for item in retrieved_chunks:
+            chunk = item.chunk
+            citations.append(
+                Citation(
+                    chunk_id=chunk.chunk_id,
+                    chunk_index=chunk.chunk_index,
+                    doc_id=chunk.doc_id,
+                    title=chunk.doc_title,
+                    doc_type=chunk.doc_type,
+                    version=chunk.version,
+                    permission_level=chunk.permission_level,
+                    published_at=chunk.published_at,
+                    is_latest=chunk.is_latest,
+                    section_title=chunk.section_title,
+                    subsection_title=chunk.subsection_title,
+                    score=item.final_score,
+                    snippet=item.snippet,
+                    chunk_text=chunk.text,
+                    source_path=chunk.source_path,
+                )
+            )
+        return citations

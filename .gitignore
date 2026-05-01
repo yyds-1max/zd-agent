@@ -8,7 +8,8 @@ __pycache__/
 .ruff_cache/
 
 .env
-
+storage/conversations.json
+storage/conversation_sessions.json
 storage/sqlite/*.db
 storage/vector/*
 !storage/vector/.gitkeep

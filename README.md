@@ -1,21 +1,55 @@
-# 知达智能体演示项目
+# 知达Agent
 
-该智能知识Agent面向企业办公场景下知识管理分散、获取被动等核心问题，打造可精准解答知识疑问、主动推送适配场景信息的智能知识助手。实现打破信息孤岛、激活知识价值、全面提升团队协作效率的核心价值。
-当前仍处于开发版本，核心聚焦：
+面向企业用户的智能知识分发助手。项目聚焦企业内部知识问答场景，围绕“查得到、答得准、看得到最新版本、且符合权限边界”来设计主链路。
+
+当前仓库已具备一个可运行的后端原型，支持本地样例知识库、权限感知检索、多轮会话理解、版本校验与飞书 Bot 回调。
+
+## 项目定位
+
+企业内部知识问答和知识分发，通常会遇到几个核心问题：
+
+- 同一主题存在多个版本，员工容易看到旧制度
+- 不同角色、部门、项目成员看到的内容范围不同
+- 用户提问常常是口语化追问，而不是标准搜索词
+- 知识分散在制度、FAQ、项目资料、会议结论中，检索路径不统一
+
+知达Agent 当前的实现重点，就是把这些问题放进一条统一的问答链路里处理。
+
+## 当前能力
+
 - 权限感知检索
+  - 检索前先根据 `role / department / title / level / project` 做访问范围过滤
+  - 支持飞书联系人信息与本地用户目录双来源
+- 多源知识问答
+  - 样例数据覆盖制度、项目资料、FAQ、聊天结论等类型
+  - 文档会被切分为 chunk，并继承版本、主题、权限等元数据
+- 混合检索与重排
+  - 使用 BM25 + Chroma 向量检索混合召回
+  - 通过 RRF 融合结果，并支持 `gte-rerank-v2` 重排
+  - 当依赖或密钥不可用时，可自动回退到本地近似能力
 - 版本感知回答
-- 个性化分发
+  - 支持按 `status / version / published_at` 判断推荐版本
+  - 当用户命中旧版内容时，可补充版本提醒和差异说明
+- 多轮会话理解
+  - 支持基于历史上下文改写追问
+  - 会话记录默认落到本地 JSON 文件，便于 Demo 和调试
+- Agent 化编排
+  - 主流程由主 Agent 协调画像、检索、版本检查、差异分析和答案生成
+  - 优先使用 LangGraph 风格编排，便于后续扩展成更复杂的工作流
+- 飞书 Bot 接入
+  - 支持飞书事件回调入口
+  - 支持基于消息发送人的 `open_id / user_id` 做权限感知问答
+  - 支持“新建会话”菜单事件，便于重置上下文
 
+## 适合演示的典型场景
 
-## 项目结构
-- `app/`：后端 API、领域服务、流程编排。
-- `data/`：原始样本、处理产物、固定夹具数据。
-- `scripts/`：数据准备和入库脚本。
-- `docs/`：架构与交付计划。
-- `frontend/web/`：前端页面占位目录。
-- `bot/feishu/`：飞书机器人占位目录。
-- `tests/`：单元与集成测试。
+- 员工提问“出差报销最新标准是什么”，系统优先返回当前生效制度并附带引用
+- 财务、项目经理、普通员工提问同一问题，返回结果因权限不同而不同
+- 用户连续追问“那销售部门适用吗？”，系统结合上一轮上下文理解问题
+- 用户命中旧版制度内容时，系统提示当前推荐版本，并给出变更摘要
+- 飞书 Bot 收到企业内部问题后，直接复用后端问答链路返回答案
 
+<<<<<<< HEAD
 ## 快速启动
 ```
 python -m venv .venv
@@ -25,126 +59,267 @@ python scripts/demo_cli.py
 ```
 
 ## 入库与查询
-```
-# 执行知识入库（读取 data/fixtures 下的 .txt 文档）
-python scripts/ingest_knowledge.py --source-dir data/fixtures
+=======
+## 核心流程
+
+```mermaid
+flowchart LR
+    A[用户提问] --> B[用户画像与意图识别]
+    B --> C[权限过滤]
+    C --> D[BM25 + 向量混合检索]
+    D --> E[RRF 融合与重排]
+    E --> F[版本检查 / 差异分析]
+    F --> G[答案生成]
+    G --> H[引用与版本提示返回]
 ```
 
-## CLI 端到端演示
+## 技术栈
+
+- 后端框架：FastAPI
+- 模型编排：LangChain、LangGraph
+- 向量存储：Chroma
+- 检索策略：BM25 + 向量检索 + RRF + Rerank
+- LLM：DashScope 兼容接口，默认 `qwen3-max`
+- Embedding：默认 `text-embedding-v4`
+- Rerank：默认 `gte-rerank-v2`
+- 外部集成：飞书开放平台 `lark-oapi`
+- 测试：Pytest
+
+## 已实现模块
+
+- `QueryPipeline`
+  - 统一处理会话上下文、问题改写和主问答链路
+- `KnowledgeDispatchMainAgent`
+  - 负责意图判断、工具协调和最终回答生成
+- `UserProfileTool`
+  - 负责用户画像补全、项目名识别、意图辅助判断
+- `KnowledgeRetrievalTool`
+  - 负责权限过滤后的知识召回与补充检索
+- `LatestVersionTool`
+  - 负责当前推荐版本判断
+- `VersionDiffTool`
+  - 负责旧版与新版差异总结
+- 飞书 Bot 服务
+  - 负责事件校验、消息接收、回复发送和会话切换
+
+## 仓库结构
+
+```text
+.
+├── app/                    # 核心后端代码
+│   ├── api/                # FastAPI 路由
+│   ├── core/               # 配置与基础组件
+│   ├── pipelines/          # 主流程编排
+│   ├── repositories/       # 数据访问层
+│   ├── schemas/            # 数据结构定义
+│   └── services/           # 检索、画像、版本、Agent 等服务
+├── bot/feishu/             # 飞书 Bot 说明
+├── data/                   # 样例知识与 mock 用户目录
+├── docs/                   # 架构与路线图文档
+├── frontend/web/           # Web 前端占位目录
+├── scripts/                # 索引重建与 LLM smoke test 脚本
+├── storage/                # 本地持久化数据
+└── tests/                  # 单元测试
+>>>>>>> feat: refactor query pipeline and update GitHub README
+```
+
+## 样例数据
+
+当前仓库已经内置一套可直接演示的样例知识：
+
+- 制度文档：如差旅与报销制度的多个版本
+- FAQ：常见办公问题与财务 FAQ
+- 项目资料：项目北极星需求说明、周报、交付节点
+- 聊天结论：从项目群结论中沉淀出的可检索知识
+- 权限与元数据样本：用于演示权限差异和治理规则
+
+Demo 用户也已经内置：
+
+- `u_employee_li`：普通员工
+- `u_finance_wang`：财务专员
+- `u_pm_zhou`：项目经理
+- `u_newhire_chen`：新员工
+
+## 快速开始
+
+### 1. 安装依赖
+
 ```bash
-python scripts/demo_cli.py
+pip install -r requirements.txt
 ```
 
-CLI 输入格式固定为：
-`问题：***。职级：***。部门：***。`
+### 2. 配置环境变量
 
-示例：
-`问题：出差报销最新标准是什么？。职级：普通员工。部门：人力。`
+```bash
+cp .env.example .env
+```
 
-输入后可在 CLI 内继续测试：
-- `click <引用序号>`：记录引用点击
-- `feedback`：提交有帮助/过期反馈
-- `recommend`：查看推荐结果
-- `push`：触发手动推送
-- `next`：继续下一问
-- `exit`：退出
+默认情况下，即使不开启真实模型能力，项目也可以基于本地样例数据跑通主流程。
 
-向量索引默认使用 Chroma，落盘目录为 `storage/vector/`。
-Embedding 默认使用 DashScope `text-embedding-v4`，请先配置 `DASHSCOPE_API_KEY`。
+如果希望启用完整能力，建议至少配置：
 
+```env
+DASHSCOPE_API_KEY=your_api_key
+ENABLE_USER_PROFILE_LLM=true
+ENABLE_CONVERSATION_ROUTER_LLM=true
+ENABLE_ANSWER_LLM=true
+ENABLE_VERSION_DIFF_LLM=true
+```
+
+如果需要接入飞书，再补充：
+
+```env
+FEISHU_BOT_ENABLED=true
+FEISHU_CONTACT_API_ENABLED=true
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_VERIFICATION_TOKEN=xxx
+```
+
+## 运行方式
+
+### CLI 问答
+
+```bash
+python -m app.main --user-id u_employee_li --question "出差报销最新标准是什么？"
+```
+
+<<<<<<< HEAD
 ## LLM 配置
 问答主链路中的意图解析、主答案生成、版本差异总结默认使用 `qwen3-max`。
+=======
+支持多轮会话参数：
+>>>>>>> feat: refactor query pipeline and update GitHub README
 
 ```bash
-# .env
-FEISHU_BASE_URL=https://open.feishu.cn
-FEISHU_APP_ID=你的飞书AppID
-FEISHU_APP_SECRET=你的飞书AppSecret
-# 可选：直接配置可用 token，配置后会跳过 app_id/app_secret 换 token
-FEISHU_TENANT_ACCESS_TOKEN=
-FEISHU_USER_ID_TYPE=open_id
-FEISHU_DEPARTMENT_ID_TYPE=open_department_id
-
-CHAT_MODEL=qwen3-max
-ANSWER_MODEL=qwen3-max
-ENABLE_LLM_ANSWER_GENERATION=true
-VERSION_DIFF_MODEL=qwen3-max
-ENABLE_LLM_VERSION_DIFF=true
-CHAT_CONCLUSION_MODEL=qwen3-max
-ENABLE_LLM_CHAT_CONCLUSION=false
-RERANK_MODEL=gte-rerank
-ENABLE_MODEL_RERANK=false
-DASHSCOPE_API_KEY=你的Key
-OPENAI_BASE_URL=
+python -m app.main \
+  --user-id u_employee_li \
+  --conversation-id demo-conv-1 \
+  --question "那销售部门适用吗？"
 ```
 
-说明：提问时身份识别会优先调用飞书通讯录 API 获取用户与部门信息（项目从问题中提取，未提及则为 `unknown`）。
-`IntentParserService` 会优先使用 DashScope 兼容端点调用 `qwen3-max`。
-聊天类知识入库前会自动做“聊天结论提炼”（规则默认开启，LLM 提炼可选开启）。
-主答案生成会将 rerank 返回的引用片段输入模型，并强制检查“版本/引用”字段。
-检索阶段支持可选 rerank 模型，默认 `gte-rerank`，并带规则兜底重排。
-命中旧版本时，版本差异默认优先使用 LLM 总结，不可用时回退规则对比。
+### 启动 API 服务
 
-## Query 工作流（LangGraph）
-`/query` 主链路已通过 LangGraph 编排以下节点：
-1. `identity`：实时获取用户身份（飞书用户与部门 + 问题内项目提取）
-2. `intent`：解析意图与检索 query（LLM 优先，规则兜底）
-3. `retrieve`：权限前置检索 + 兜底过滤
-4. `version`：版本提示构建
-5. `answer`：结构化答案生成（制度类模板/通用模板）
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
-当本地未安装 `langgraph` 时，会自动回退为同逻辑的顺序执行。
+接口：
 
+- `POST /query`
+- 飞书事件回调默认路径：`POST /feishu/events`
+
+<<<<<<< HEAD
 ## 推荐与推送接口
 - `POST /recommendation`：基于用户画像 + 最近查询/点击行为 + 文档新鲜度返回结构化推荐。
 - `POST /recommendation/push/trigger`：手动触发推荐推送并落推送日志（`recommendation_push_logs`）。
+=======
+### `/query` 请求示例
+>>>>>>> feat: refactor query pipeline and update GitHub README
 
-`/recommendation` 返回示例：
 ```json
 {
-  "items": [
-    {
-      "doc_id": "fixture-02",
-      "title": "字节跳动员工差旅与报销制度（V2.0）",
-      "source_type": "policy",
-      "version": "V2.0",
-      "updated_at": "2026-03-15T00:00:00",
-      "summary": "报销需在出差结束后10个自然日内发起...",
-      "score": 4.2,
-      "reasons": ["角色/部门/项目权限匹配", "文档近期更新", "匹配最近搜索主题"]
-    }
-  ]
+  "user_id": "u_employee_li",
+  "user_id_type": "open_id",
+  "question": "出差报销最新标准是什么？",
+  "top_k": 4,
+  "conversation_id": "demo-conv-1",
+  "use_history": true
 }
 ```
 
+响应中会包含：
 
+- `answer`：最终回答
+- `citations`：引用片段
+- `version_checks`：版本校验结果
+- `version_diffs`：版本差异结果
+- `version_notice`：版本提醒
+- `tool_trace`：工具链执行轨迹
+
+## 索引重建
+
+当你修改了 `data/fixtures` 中的知识内容后，可以重建 Chroma 索引：
+
+```bash
+python scripts/rebuild_index.py
+```
+
+如果想保留现有 collection，仅执行 upsert：
+
+```bash
+python scripts/rebuild_index.py --keep-existing
+```
+
+说明：
+
+- 该脚本依赖 `chromadb`
+- 需要可用的 `DASHSCOPE_API_KEY`
+- 默认索引路径为 `storage/vector/chroma`
+
+## LLM Smoke Test
+
+可以单独验证 LLM 相关链路：
+
+```bash
+python scripts/test_llm_chain.py profile
+python scripts/test_llm_chain.py answer
+python scripts/test_llm_chain.py both
+```
+
+打印完整测试上下文：
+
+```bash
+python scripts/test_llm_chain.py answer --print-context
+```
+
+## 测试
+
+运行单元测试：
+
+```bash
+pytest
+```
+
+当前测试已覆盖的重点包括：
+
+<<<<<<< HEAD
 ## 演示推荐输入
 由于当前尚未接入飞书，且暂无真实企业知识文档，该项目暂且使用模拟知识文档
 
 注：该项目中知识库均为演示模拟所建，其中所涉及的公司名、项目名等，与实际字节跳动公司、项目无关
+=======
+- 问答主链路
+- 权限过滤
+- 版本判断
+- 飞书 Bot 回调与消息处理
+- 多轮会话上下文
+>>>>>>> feat: refactor query pipeline and update GitHub README
 
-1.演示权限差异（普通员工 vs 财务）
-    问题：同一出差行程出现多张相近时间的打车票如何处理？。职级：普通员工。部门：人力。
-    问题：同一出差行程出现多张相近时间的打车票如何处理？。职级：财务专员。部门：财务。
+## 当前状态
 
+这是一个偏后端能力验证的原型版本，目前更适合：
 
-2.权限差异（同职级不同部门）
-    问题：项目北极星的交付节点是什么？。职级：项目经理。部门：人力。
-    问题：项目北极星的交付节点是什么？。职级：项目经理。部门：交付。
+- 企业知识助手 Demo
+- RAG / Agent 主链路验证
+- 飞书知识问答机器人 PoC
+- 企业内知识治理产品的早期方案孵化
 
-3.旧版命中提醒（版本感知）
-    问题：字节跳动员工差旅与报销制度V1.0里报销时限是多少？。职级：普通员工。部门：人力。
-    问题：出差报销最新标准是什么？。职级：普通员工。部门：人力。
+以下方向已留出结构，但仍有继续完善空间：
 
+- 推荐与订阅触发链路的产品化闭环
+- 前端 Web 控制台
+- 更完整的知识入库 pipeline
+- 反馈治理与运营数据看板
+- 生产级权限系统与企业数据源打通
 
-4.推荐/推送效果（先造行为再展示）
-    问题：报销超时提交如何处理？。职级：财务专员。部门：财务。
-    问题：哪些情况需要人工复核报销单？。职级：财务专员。部门：财务。
+## 相关文档
 
-    每条回答后在 CLI 输入：
-    click 1
+- [架构说明](docs/ARCHITECTURE.md)
+- [路线图](docs/ROADMAP.md)
+- [样例数据说明](data/README.md)
+- [飞书 Bot 说明](bot/feishu/README.md)
 
-    然后输入：
-    recommend
-    push
+## License
 
+当前仓库未单独声明开源许可证；如果计划公开发布到 GitHub，建议补充 `LICENSE` 文件后再对外分发。

@@ -1,141 +1,260 @@
-import json
-import time
-from typing import Any
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from __future__ import annotations
 
-from app.core.config import settings
+from typing import Any, Protocol
+
+from app.repositories.user_repository import UserRepository
+from app.schemas.user import DirectoryUser
+
+
+class ContactService(Protocol):
+    def get_user_profile(self, user_id: str, user_id_type: str = "open_id") -> DirectoryUser:
+        ...
+
+
+class FeishuContactServiceError(RuntimeError):
+    pass
+
+
+class MockFeishuContactService:
+    def __init__(self, user_repository: UserRepository):
+        self.user_repository = user_repository
+
+    def get_user_profile(self, user_id: str, user_id_type: str = "open_id") -> DirectoryUser:
+        user = self.user_repository.get_by_user_id(user_id)
+        return user.model_copy(
+            update={
+                "user_id_type": user_id_type,
+                "source": "mock_feishu_directory",
+            }
+        )
 
 
 class FeishuContactService:
-    """封装飞书通讯录 API：获取用户信息与所属部门。"""
+    def __init__(
+        self,
+        app_id: str,
+        app_secret: str,
+        *,
+        log_level: str = "INFO",
+        default_user_id_type: str = "open_id",
+        user_repository: UserRepository | None = None,
+    ):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.log_level = log_level.upper()
+        self.default_user_id_type = default_user_id_type
+        self.user_repository = user_repository
+        self._client: Any | None = None
 
-    def __init__(self) -> None:
-        self._cached_tenant_token: str | None = None
-        self._token_expire_at: float = 0.0
+    def get_user_profile(self, user_id: str, user_id_type: str = "open_id") -> DirectoryUser:
+        effective_user_id_type = user_id_type or self.default_user_id_type
+        try:
+            return self._fetch_user_profile(user_id, effective_user_id_type)
+        except Exception as exc:
+            fallback_user = self._fallback_user(user_id, effective_user_id_type)
+            if fallback_user is not None:
+                return fallback_user
+            raise FeishuContactServiceError(
+                f"Failed to load user profile from Feishu for `{user_id}` ({effective_user_id_type})."
+            ) from exc
 
-    def get_user_profile(self, user_id: str) -> dict[str, Any] | None:
-        token = self._get_tenant_access_token()
-        if not token:
+    def _fetch_user_profile(self, user_id: str, user_id_type: str) -> DirectoryUser:
+        lark, contact_api = self._import_lark_modules()
+        client = self._get_client(lark)
+        GetDepartmentRequest = contact_api.GetDepartmentRequest
+        GetJobLevelRequest = contact_api.GetJobLevelRequest
+        GetUserRequest = contact_api.GetUserRequest
+
+        request = (
+            GetUserRequest.builder()
+            .user_id(user_id)
+            .user_id_type(user_id_type)
+            .build()
+        )
+        response = client.contact.v3.user.get(request)
+        if not response.success():
+            raise FeishuContactServiceError(
+                self._format_error(
+                    "GetUser",
+                    response.code,
+                    response.msg,
+                    response.get_log_id(),
+                )
+            )
+
+        user = response.data.user
+        department_ids = list(getattr(user, "department_ids", []) or [])
+        department_id = department_ids[0] if department_ids else None
+        job_level_id = getattr(user, "job_level_id", None)
+
+        department_name = None
+        if department_id:
+            department_request = GetDepartmentRequest.builder().department_id(department_id).build()
+            department_response = client.contact.v3.department.get(department_request)
+            if department_response.success() and department_response.data.department is not None:
+                department_name = getattr(department_response.data.department, "name", None)
+
+        job_level_name = None
+        if job_level_id:
+            job_level_request = GetJobLevelRequest.builder().job_level_id(job_level_id).build()
+            job_level_response = client.contact.v3.job_level.get(job_level_request)
+            if job_level_response.success() and job_level_response.data.job_level is not None:
+                job_level_name = getattr(job_level_response.data.job_level, "name", None)
+
+        fallback_user = self.user_repository.find_by_user_id(user_id) if self.user_repository else None
+        return self._build_directory_user(
+            requested_user_id=user_id,
+            user_id_type=user_id_type,
+            feishu_user=user,
+            department_id=department_id,
+            department_name=department_name,
+            job_level_id=job_level_id,
+            job_level_name=job_level_name,
+            fallback_user=fallback_user,
+        )
+
+    def _fallback_user(self, user_id: str, user_id_type: str) -> DirectoryUser | None:
+        if self.user_repository is None:
             return None
-
-        user = self._get_user(user_id=user_id, token=token)
-        if not user:
+        user = self.user_repository.find_by_user_id(user_id)
+        if user is None:
             return None
-
-        department_name = self._resolve_department_name(user.get("department_ids"), token)
-        return {
-            "user_id": str(user.get("user_id") or user_id),
-            "name": str(user.get("name") or ""),
-            "job_title": str(user.get("job_title") or ""),
-            "department": department_name,
-            "department_ids": user.get("department_ids") or [],
-        }
-
-    def _get_tenant_access_token(self) -> str | None:
-        direct_token = settings.feishu_tenant_access_token.strip()
-        if direct_token:
-            return direct_token
-
-        now = time.time()
-        if self._cached_tenant_token and now < self._token_expire_at:
-            return self._cached_tenant_token
-
-        app_id = settings.feishu_app_id.strip()
-        app_secret = settings.feishu_app_secret.strip()
-        if not app_id or not app_secret:
-            return None
-
-        url = f"{settings.feishu_base_url.rstrip('/')}/open-apis/auth/v3/tenant_access_token/internal"
-        payload = {"app_id": app_id, "app_secret": app_secret}
-        response = self._request_json("POST", url, payload=payload)
-        if not response:
-            return None
-        if int(response.get("code", -1)) != 0:
-            return None
-
-        token = str(response.get("tenant_access_token") or "").strip()
-        expire = int(response.get("expire", 0) or 0)
-        if not token:
-            return None
-
-        # 提前 2 分钟刷新，避免边界失效。
-        self._cached_tenant_token = token
-        self._token_expire_at = now + max(expire - 120, 60)
-        return token
-
-    def _get_user(self, *, user_id: str, token: str) -> dict[str, Any] | None:
-        query = urlencode(
-            {
-                "user_id_type": settings.feishu_user_id_type,
-                "department_id_type": settings.feishu_department_id_type,
+        return user.model_copy(
+            update={
+                "user_id_type": user_id_type,
+                "source": "mock_feishu_directory",
             }
         )
-        url = (
-            f"{settings.feishu_base_url.rstrip('/')}/open-apis/contact/v3/users/{quote(user_id, safe='')}"
-            f"?{query}"
+
+    def _build_directory_user(
+        self,
+        *,
+        requested_user_id: str,
+        user_id_type: str,
+        feishu_user: Any,
+        department_id: str | None,
+        department_name: str | None,
+        job_level_id: str | None,
+        job_level_name: str | None,
+        fallback_user: DirectoryUser | None,
+    ) -> DirectoryUser:
+        resolved_user_id = self._first_non_empty(
+            self._user_id_from_payload(feishu_user, user_id_type),
+            requested_user_id,
         )
-        response = self._request_json("GET", url, token=token)
-        if not response:
-            return None
-        if int(response.get("code", -1)) != 0:
-            return None
-        data = response.get("data") or {}
-        user = data.get("user") or {}
-        if not isinstance(user, dict):
-            return None
-        return user
-
-    def _resolve_department_name(self, department_ids: Any, token: str) -> str:
-        if not isinstance(department_ids, list) or not department_ids:
-            return "unknown"
-
-        department_id = str(department_ids[0]).strip()
-        if not department_id:
-            return "unknown"
-
-        query = urlencode(
-            {
-                "department_id_type": settings.feishu_department_id_type,
-                "user_id_type": settings.feishu_user_id_type,
-            }
+        name = self._first_non_empty(
+            getattr(feishu_user, "name", None),
+            fallback_user.name if fallback_user else None,
+            requested_user_id,
         )
-        url = (
-            f"{settings.feishu_base_url.rstrip('/')}/open-apis/contact/v3/departments/"
-            f"{quote(department_id, safe='')}?{query}"
+        title = self._first_non_empty(
+            getattr(feishu_user, "job_title", None),
+            getattr(feishu_user, "title", None),
+            fallback_user.title if fallback_user else None,
+            "未知岗位",
         )
-        response = self._request_json("GET", url, token=token)
-        if not response:
-            return "unknown"
-        if int(response.get("code", -1)) != 0:
-            return "unknown"
+        level = self._first_non_empty(
+            job_level_name,
+            getattr(feishu_user, "job_level", None),
+            job_level_id,
+            fallback_user.level if fallback_user else None,
+            "未知职级",
+        )
+        department = self._first_non_empty(
+            department_name,
+            fallback_user.department if fallback_user else None,
+            "未知部门",
+        )
+        role = self._infer_role(
+            department=department,
+            title=title,
+            level=level,
+            fallback_role=fallback_user.role if fallback_user else None,
+        )
 
-        data = response.get("data") or {}
-        department = data.get("department") or {}
-        name = str(department.get("name") or "").strip()
-        return name or "unknown"
+        return DirectoryUser(
+            user_id=resolved_user_id,
+            user_id_type=user_id_type,
+            name=name,
+            department=department,
+            department_id=department_id,
+            title=title,
+            level=level,
+            job_level_id=job_level_id,
+            role=role,
+            projects=list(fallback_user.projects) if fallback_user else [],
+            managed_projects=list(fallback_user.managed_projects) if fallback_user else [],
+            is_new_hire=fallback_user.is_new_hire if fallback_user else False,
+            source="feishu_contact_api",
+        )
 
-    def _request_json(
-        self, method: str, url: str, token: str | None = None, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any] | None:
-        body: bytes | None = None
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def _get_client(self, lark: Any) -> Any:
+        if self._client is None:
+            self._client = (
+                lark.Client.builder()
+                .app_id(self.app_id)
+                .app_secret(self.app_secret)
+                .log_level(getattr(lark.LogLevel, self.log_level, lark.LogLevel.INFO))
+                .build()
+            )
+        return self._client
 
-        request = Request(url=url, method=method.upper(), headers=headers, data=body)
+    def _import_lark_modules(self) -> tuple[Any, Any]:
         try:
-            with urlopen(request, timeout=settings.feishu_http_timeout) as response:
-                raw = response.read().decode("utf-8")
-        except Exception:
-            return None
+            import lark_oapi as lark
+            from lark_oapi.api.contact import v3 as contact_v3
+        except ModuleNotFoundError as exc:
+            raise FeishuContactServiceError(
+                "Missing dependency `lark-oapi`. Install it before enabling Feishu contact API."
+            ) from exc
+        return lark, contact_v3
 
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        return parsed
+    def _user_id_from_payload(self, feishu_user: Any, user_id_type: str) -> str | None:
+        if user_id_type == "open_id":
+            return getattr(feishu_user, "open_id", None)
+        if user_id_type == "union_id":
+            return getattr(feishu_user, "union_id", None)
+        if user_id_type == "user_id":
+            return getattr(feishu_user, "user_id", None)
+        return getattr(feishu_user, user_id_type, None)
+
+    def _infer_role(
+        self,
+        *,
+        department: str,
+        title: str,
+        level: str,
+        fallback_role: str | None,
+    ) -> str:
+        department_text = department.lower()
+        title_text = title.lower()
+        level_text = level.upper()
+
+        if "admin" in title_text or "管理员" in title:
+            inferred_role = "admin"
+        elif "财务" in department or "finance" in department_text or "财务" in title:
+            inferred_role = "finance"
+        elif "项目经理" in title or title_text == "pm" or "project manager" in title_text:
+            inferred_role = "pm"
+        elif any(keyword in title for keyword in ["负责人", "总监", "主管", "leader", "Leader"]):
+            inferred_role = "department_head"
+        elif level_text.startswith("M"):
+            inferred_role = "department_head"
+        else:
+            inferred_role = "employee"
+
+        if inferred_role == "employee" and fallback_role:
+            return fallback_role
+        return inferred_role
+
+    def _first_non_empty(self, *values: str | None) -> str:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    def _format_error(self, action: str, code: Any, message: Any, log_id: Any) -> str:
+        return f"{action} failed, code={code}, msg={message}, log_id={log_id}"

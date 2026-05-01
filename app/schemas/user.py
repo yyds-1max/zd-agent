@@ -1,8 +1,29 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 
 
-class UserProfile(BaseModel):
-    user_id: str = Field(..., description="用户唯一标识")
-    role: str = Field(..., description="角色名称，例如员工/财务/项目经理")
-    department: str = Field(..., description="部门名称")
-    projects: list[str] = Field(default_factory=list, description="关联项目列表")
+class DirectoryUser(BaseModel):
+    user_id: str
+    user_id_type: str = "user_id"
+    name: str
+    department: str
+    department_id: str | None = None
+    title: str
+    level: str
+    job_level_id: str | None = None
+    role: str
+    projects: list[str] = Field(default_factory=list)
+    managed_projects: list[str] = Field(default_factory=list)
+    is_new_hire: bool = False
+    source: str = "mock_feishu_directory"
+
+
+class UserProfile(DirectoryUser):
+    project_mentions: list[str] = Field(default_factory=list)
+    active_projects: list[str] = Field(default_factory=list)
+    intent_hint: str | None = None
+
+    @property
+    def accessible_projects(self) -> set[str]:
+        return set(self.projects) | set(self.managed_projects)

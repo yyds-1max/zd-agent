@@ -1,0 +1,46 @@
+[
+  {
+    "user_id": "u_employee_li",
+    "name": "李然",
+    "department": "市场部",
+    "title": "运营专员",
+    "level": "P2",
+    "role": "employee",
+    "projects": [],
+    "managed_projects": [],
+    "is_new_hire": false
+  },
+  {
+    "user_id": "u_finance_wang",
+    "name": "王敏",
+    "department": "财务部",
+    "title": "财务专员",
+    "level": "P3",
+    "role": "finance",
+    "projects": ["北极星"],
+    "managed_projects": [],
+    "is_new_hire": false
+  },
+  {
+    "user_id": "u_pm_zhou",
+    "name": "周航",
+    "department": "产品部",
+    "title": "项目经理",
+    "level": "M1",
+    "role": "pm",
+    "projects": ["北极星"],
+    "managed_projects": ["北极星"],
+    "is_new_hire": false
+  },
+  {
+    "user_id": "u_newhire_chen",
+    "name": "陈晨",
+    "department": "研发部",
+    "title": "研发工程师",
+    "level": "P1",
+    "role": "employee",
+    "projects": ["北极星"],
+    "managed_projects": [],
+    "is_new_hire": true
+  }
+]

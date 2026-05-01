@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 
 
-class QueryIntent(BaseModel):
-    original_question: str
-    retrieval_query: str
-    intent_type: str = "general"
+class IntentResult(BaseModel):
+    name: str
+    confidence: float = 0.0
     keywords: list[str] = Field(default_factory=list)
-    need_latest: bool = False
-    source: str = "rule"
+    project_names: list[str] = Field(default_factory=list)
+    version_sensitive: bool = False
+    reasoning: str = ""

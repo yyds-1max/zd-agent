@@ -1,36 +1,80 @@
-from app.schemas.citation import Citation
+from __future__ import annotations
+
+from app.schemas.knowledge import KnowledgeDocument
 from app.schemas.user import UserProfile
 
 
 class PermissionService:
-    def build_vector_filter(self, user: UserProfile) -> dict:
-        clauses = [
-            self._scope_clause("role_scope", [user.role]),
-            self._scope_clause("department_scope", [user.department]),
-            self._scope_clause("project_scope", user.projects),
-        ]
-        return {"$and": clauses}
+    def can_access(self, profile: UserProfile, document: KnowledgeDocument) -> bool:
+        permission = document.permission_level
+        department = profile.department
+        project_scope = profile.accessible_projects
+        project_related = not document.project_name or document.project_name in project_scope
 
-    def filter_citations(self, items: list[Citation], user: UserProfile) -> list[Citation]:
-        return [item for item in items if self.is_citation_allowed(item, user)]
-
-    def is_citation_allowed(self, item: Citation, user: UserProfile) -> bool:
-        role_ok = self._scope_match(item.role_scope, [user.role])
-        department_ok = self._scope_match(item.department_scope, [user.department])
-        project_ok = self._scope_match(item.project_scope, user.projects)
-        return role_ok and department_ok and project_ok
-
-    @staticmethod
-    def _scope_clause(field: str, values: list[str]) -> dict:
-        checks: list[dict] = [{field: {"$contains": "*"}}]
-        for value in values:
-            checks.append({field: {"$contains": value}})
-        return {"$or": checks}
-
-    @staticmethod
-    def _scope_match(scope: list[str], user_values: list[str]) -> bool:
-        if not scope:
-            return False
-        if "*" in scope:
+        if "全员可见" in permission:
             return True
-        return any(value in scope for value in user_values)
+        if "管理员" in permission and self._is_admin(profile):
+            return True
+        if "财务" in permission and self._is_finance(profile):
+            return True
+        if "管理者" in permission and self._is_manager(profile):
+            return True
+        if "部门负责人" in permission and self._is_manager(profile):
+            return True
+        if "项目组成员" in permission and project_related:
+            return True
+        if "项目经理" in permission and self._is_pm(profile) and project_related:
+            return True
+        if "PMO" in permission and department == "PMO" and project_related:
+            return True
+        if (
+            "研发负责人" in permission
+            and self._is_manager(profile)
+            and department.startswith("研发")
+            and project_related
+        ):
+            return True
+
+        return False
+
+    def filter_accessible(
+        self, profile: UserProfile, documents: list[KnowledgeDocument]
+    ) -> list[KnowledgeDocument]:
+        return [document for document in documents if self.can_access(profile, document)]
+
+    def _is_admin(self, profile: UserProfile) -> bool:
+        title = profile.title.lower()
+        return profile.role == "admin" or "admin" in title or "管理员" in profile.title
+
+    def _is_finance(self, profile: UserProfile) -> bool:
+        department = profile.department.lower()
+        title = profile.title.lower()
+        return (
+            profile.role == "finance"
+            or "财务" in profile.department
+            or "finance" in department
+            or "财务" in profile.title
+            or "finance" in title
+        )
+
+    def _is_manager(self, profile: UserProfile) -> bool:
+        title = profile.title
+        lowered_title = title.lower()
+        manager_keywords = ["负责人", "总监", "主管", "leader"]
+        return (
+            self._is_admin(profile)
+            or profile.role == "department_head"
+            or profile.level.upper().startswith("M")
+            or any(keyword in title or keyword in lowered_title for keyword in manager_keywords)
+        )
+
+    def _is_pm(self, profile: UserProfile) -> bool:
+        title = profile.title
+        lowered_title = title.lower()
+        return (
+            self._is_admin(profile)
+            or profile.role == "pm"
+            or "项目经理" in title
+            or lowered_title == "pm"
+            or "project manager" in lowered_title
+        )
