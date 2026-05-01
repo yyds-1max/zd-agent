@@ -28,5 +28,6 @@ frontend/web/dist/
 调用飞书API获取用户所在部门信息.md
 调用飞书API获取用户信息.md
 事件调用.md
+事件解密.md
 ngrok
 ngrok-v3-stable-linux-amd64.tgz
